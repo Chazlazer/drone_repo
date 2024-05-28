@@ -9,6 +9,7 @@
 #include <math.h>
 #include <sys/time.h> // For gettimeofday function
 #include <ncurses.h>
+#include <pthread.h>
 
 #define KEY_Q 113
 #define KEY_W 119
@@ -33,6 +34,10 @@ void armedStatus();
 int wakeup_esc();
 void controlMixer();
 void controlANGLE();
+void loopBlink();
+void *  threadFunction(void * arg);
+void loopRate(int freq);
+
 // Global Variables
 static rc_mpu_data_t mpu_data;
 
@@ -148,11 +153,11 @@ bool armedFly = false;
 
 int value = 0;
 int clear_counter = 0;
-float speed_control = 0.0;
-float speed_roll = 0.0;
-float speed_pitch = 0.0;
-float roll_angle = 0.0;
-float pitch_angle = 0.0;
+int speed_control = 1000;
+int speed_roll = 1500;
+int speed_pitch = 1500;
+int roll_angle = 1500;
+int pitch_angle = 1500;
 int exit = 0;
 
 float damping_dt = 0;
@@ -207,13 +212,6 @@ int main() {
         printf("Yaw     : a-left, d-right\n");
         printf("Roll    : q-left, e-right\n");
         printf("t to quit\n");
-        initscr();
-        cbreak();
-        noecho();
-        timeout(10);
-
-        char key = getch();
-        value = key;
 
         //Set radio channels to default (safe) values before entering main loop
         channel_1_pwm = channel_1_fs;
@@ -226,42 +224,47 @@ int main() {
 
         current_time = micros();
         rc_set_state(RUNNING);
+
+        // Create pthread
+
+        pthread_t keyboard_thread;
+        pthread_create(&keyboard_thread, NULL, threadFunction, NULL);
+
+        // Sleep 2 seconds
+        rc_usleep(200000);
         while(rc_get_state()!=EXITING){
+                // Keep track of how much time has elasped since last loop
+
                 prev_time = current_time;
                 current_time = micros();
                 dt = (current_time - prev_time) / 1000000.0;;
 
+                loopBlink();
+
                 // Measure Sensors
                 read_sensors();
 
-                Madgwick(p,q,r,ax,ay,az,mx,my,mz, dt);
+                Madgwick(GyroX, -GyroY, -GyroZ, -AccX, AccY, AccZ, MagY, -MagX, MagZ, dt);
+                // printw("\nPitch: %5.2f Roll: %5.2f | dt %2.5f",pitch_IMU, roll_IMU,dt);
 
-                getDesState(key);
+                getDesState();
 
                 controlANGLE();
 
                 controlMixer();
-
-                //printf("Phi: %5.2f Theta: %5.2f | dt %2.5f  \r\n", roll_IMU, pitch_IMU, dt);
-                printw("\nM1:%f | M2: %f \nM3%f | M4%f", m1_command_scaled, m2_command_scaled,m3_command_scaled,m4_command_scaled);
+                // printf("\nThrottle: %d", speed_control);
+                // printw("\nM1:%f | M2: %f \nM3%f | M4%f", m1_command_scaled, m2_command_scaled,m3_command_scaled,m4_command_scaled);
                 // Send Motor Command
                 rc_servo_send_esc_pulse_normalized(1,m1_command_scaled);
                 rc_servo_send_esc_pulse_normalized(2,m2_command_scaled);
                 rc_servo_send_esc_pulse_normalized(3,m3_command_scaled);
                 rc_servo_send_esc_pulse_normalized(4,m4_command_scaled);
                 // fflush(stdout); // Ensure the output is displayed immediately
-
-                if(rc_get_state()==RUNNING){
-                        rc_led_set(RC_LED_GREEN, 1);
-                        rc_led_set(RC_LED_RED, 0);
-                }
-                else{
-                        rc_led_set(RC_LED_GREEN, 0);
-                        rc_led_set(RC_LED_RED, 1);
-                }
                 // always sleep at some point
-                rc_usleep(500);
+                loopRate(2000);
+                //rc_usleep(500);
         }
+        pthread_join(&threadFunction, NULL);
         //Exit Curses Terminal
         endwin();
         // turn off LEDs and close file descriptors
@@ -273,6 +276,16 @@ int main() {
         return 0;
 }
 
+void loopBlink(){
+    if(rc_get_state()==RUNNING){
+        rc_led_set(RC_LED_GREEN, 1);
+        rc_led_set(RC_LED_RED, 0);
+        }
+    else{
+        rc_led_set(RC_LED_GREEN, 0);
+        rc_led_set(RC_LED_RED, 1);
+    }
+}
 
 void Madgwick(float gx, float gy, float gz, float ax, float ay, float az, float mx, float my, float mz, float invSampleFreq) {
   //DESCRIPTION: Attitude estimation through sensor fusion - 9DOF
@@ -377,8 +390,8 @@ void Madgwick(float gx, float gy, float gz, float ax, float ay, float az, float 
   q3 *= recipNorm;
   
   //compute angles - NWU
-  roll_IMU = atan2(q0*q1 + q2*q3, 0.5f - q1*q1 - q2*q2)*57.29577951; //degrees
-  pitch_IMU = -asin(constrain(-2.0f * (q1*q3 - q0*q2),-0.999999,0.999999))*57.29577951; //degrees
+  pitch_IMU = atan2(q0*q1 + q2*q3, 0.5f - q1*q1 - q2*q2)*57.29577951; //degrees
+  roll_IMU = -asin(constrain(-2.0f * (q1*q3 - q0*q2),-0.999999,0.999999))*57.29577951; //degrees
   yaw_IMU = -atan2(q1*q2 + q0*q3, 0.5f - q2*q2 - q3*q3)*57.29577951; //degrees
 }
 
@@ -407,19 +420,29 @@ void read_sensors(){
         }
 
         // Measure Acceleration
-        ax = (1.0 - B_accel)*ax + B_accel * mpu_data.accel[0]; // ax
-        ay = (1.0 - B_accel)*ay + B_accel * mpu_data.accel[1]; // ay
-        az = (1.0 - B_accel)*az + B_accel * mpu_data.accel[2]; // az
+        AccX = (1.0 - B_accel) * AccX_prev + B_accel * mpu_data.accel[0]; // ax
+        AccY = (1.0 - B_accel) * AccY_prev + B_accel * mpu_data.accel[1]; // ay
+        AccZ = (1.0 - B_accel) * AccZ_prev + B_accel * mpu_data.accel[2]; // az
+        AccX_prev = AccX;
+        AccY_prev = AccY;
+        AccZ_prev = AccZ;
 
         // Measure Gyro
-        q = (1 - B_gyro) * q + B_gyro * mpu_data.gyro[0]; // Pitch rate
-        p = (1 - B_gyro) * p + B_gyro * mpu_data.gyro[1];  // Roll rate
-        r = (1 - B_gyro) * r + B_gyro * mpu_data.gyro[2];  // Yaw rate
+        GyroX = (1.0 - B_gyro) * GyroX_prev + B_gyro * mpu_data.gyro[0]; // Pitch rate
+        GyroY = (1.0 - B_gyro) * GyroY_prev + B_gyro * mpu_data.gyro[1]; // Roll rate
+        GyroZ = (1.0 - B_gyro) * GyroZ_prev + B_gyro * mpu_data.gyro[2]; // Yaw rate
+        GyroX_prev = GyroX;
+        GyroY_prev = GyroY;
+        GyroZ_prev = GyroZ;
+
 
         // Measure Magnetometer
-        mx = mpu_data.mag[0];
-        my = mpu_data.mag[1];
-        mz = mpu_data.mag[2];
+        MagX = (1.0 - B_mag) * MagX_prev + B_mag * mpu_data.mag[0];
+        MagY = (1.0 - B_mag) * MagY_prev + B_mag * mpu_data.mag[1];
+        MagZ = (1.0 - B_mag) * MagZ_prev + B_mag * mpu_data.mag[2];
+        MagX_prev = MagX;
+        MagY_prev = MagY;
+        MagZ_prev = MagZ;
 }
 
 unsigned long micros() {
@@ -429,7 +452,7 @@ unsigned long micros() {
     return tv.tv_sec * 1000000 + tv.tv_usec;
 }
 
-void getDesState(int key) {
+void getDesState() {
     //DESCRIPTION: Normalizes desired control values to appropriate values
     /*
     * Updates the desired state variables thro_des, roll_des, pitch_des, and yaw_des. These are computed by using the raw
@@ -438,112 +461,18 @@ void getDesState(int key) {
     * (rate mode). yaw_des is scaled to be within max yaw in degrees/sec. Also creates roll_passthru, pitch_passthru, and
     * yaw_passthru variables, to be used in commanding motors/servos with direct unstabilized commands in controlMixer().
     */
-        switch (getch()) {
-                case KEY_Q:
-                        // printw("Pressed Q\n");
-                        refresh();
-                        break;
-                case KEY_W:
-                        // printw("Pressed W\n");
-                        speed_pitch = 0.5;
-                        fwd_bkwd = 1;
-                        y = 1.0;
-                        refresh();
-                        break;
-                case KEY_E:
-                        // printw("Pressed E\n");
-                        refresh();
-                        break;
-                case KEY_A:
-                        // printw("Pressed A\n");
-                        speed_roll = 0.5;
-                        left_right = 2;
-                        x = 1.0;
-                        refresh();
-                        break;
-                case KEY_S:
-                        // printw("Pressed S\n");
-                        speed_pitch = 0.5;
-                        fwd_bkwd = 2;
-                        y = 1.0;
-                        refresh();
-                        break;
-                case KEY_D:
-                        // printw("Pressed D\n");
-                        speed_roll = 0.5;
-                        left_right = 1;
-                        x = 1.0;
-                        refresh();
-                        break;
-                case KEY_Z:
-                        speed_control = speed_control + 0.05;
-                        if (speed_control > 1) {
-                        speed_control = 1;
-                        // printw("Throttle is Maxed\n");
-                        }
-                        refresh();
-                        break;
-                case KEY_X:
-                        speed_control = speed_control - 0.05;
-                        if (speed_control < 0.1) {
-                        speed_control = 0.1;
-                        // printw("Throttle is Minimum\n");
-                        }
-                        refresh();
-                        break;
-                case KEY_T:
-                        // printw("Pressed T\n");
-                        exit = 1;
-                        refresh();
-                        break;
-                }
-                clear_counter = clear_counter + 1;
-                if (clear_counter == 1) {
-                        clear_counter = 0;
-                        clear();
-                }
-                value = key;
-                // printw("\nRoll Angle: %f",roll_angle);
-                // printw("\nPitch Angle: %f",pitch_angle);
-                refresh();
-    
-//     printf("\r Sending %f",speed_control);
-        if(time_since_update > 0.01){
-        speed_roll = speed_roll * x;//(-exp(-4*x)*cos(0.1*x) + 1);
-        time_since_update = 0.0;
-        x = x - 0.1;
-        if(speed_roll < 0){
-                x = 1.0;
-        }
-        if(left_right == 1){
-                roll_angle = speed_roll;
-        }
-        if(left_right == 2){
-                roll_angle = -speed_roll;
-        }
-        speed_pitch = speed_pitch * y;//(-exp(-4*x)*cos(0.1*x) + 1);
-        time_since_update = 0.0;
-        y = y - 0.1;
-        if(speed_pitch < 0){
-                y = 1.0;
-        }
-        if(fwd_bkwd == 1){
-                pitch_angle = speed_pitch;
-        }
-        if(fwd_bkwd == 2){
-                pitch_angle = -speed_pitch;
-        }
-    }
     channel_1_pwm = speed_control;
     channel_2_pwm = roll_angle;
     channel_3_pwm = pitch_angle;
-    thro_des =  channel_1_pwm;          //(channel_1_pwm - 1000.0)/1000.0; //Between 0 and 1
-    roll_des =  channel_2_pwm;          //(channel_2_pwm - 1500.0)/500.0; //Between -1 and 1
-    pitch_des = channel_3_pwm;          //(channel_3_pwm - 1500.0)/500.0; //Between -1 and 1
-    yaw_des =   0.0;                    //(channel_4_pwm - 1500.0)/500.0; //Between -1 and 1
-    roll_passthru = roll_des/2.0;       //Between -0.5 and 0.5
-    pitch_passthru = pitch_des/2.0;     //Between -0.5 and 0.5
-    yaw_passthru = yaw_des/2.0;         //Between -0.5 and 0.5
+    channel_4_pwm = 1500;
+
+    thro_des = (channel_1_pwm - 1000.0)/1000.0; //Between 0 and 1
+    roll_des = (channel_2_pwm - 1500.0)/500.0; //Between -1 and 1
+    pitch_des = (channel_3_pwm - 1500.0)/500.0; //Between -1 and 1
+    yaw_des = (channel_4_pwm - 1500.0)/500.0; //Between -1 and 1
+    roll_passthru = roll_des/2.0; //Between -0.5 and 0.5
+    pitch_passthru = pitch_des/2.0; //Between -0.5 and 0.5
+    yaw_passthru = yaw_des/2.0; //Between -0.5 and 0.5
   
     //Constrain within normalized bounds
     thro_des = constrain(thro_des, 0.0, 1.0); //Between 0 and 1
@@ -553,8 +482,8 @@ void getDesState(int key) {
     roll_passthru = constrain(roll_passthru, -0.5, 0.5);
     pitch_passthru = constrain(pitch_passthru, -0.5, 0.5);
     yaw_passthru = constrain(yaw_passthru, -0.5, 0.5);
-    time_since_update = time_since_update + dt;
 }
+
 
 void armedStatus() {
   //DESCRIPTION: Check if the throttle cut is off and the throttle input is low to prepare for flight.
@@ -579,9 +508,9 @@ void controlANGLE() {
   //Roll
   error_roll = roll_des - roll_IMU;
   integral_roll = integral_roll_prev + error_roll*dt;
-//   if (channel_1_pwm < 1060) {   //Don't let integrator build if throttle is too low
-//     integral_roll = 0;
-//   }
+  if (channel_1_pwm < 1060) {   //Don't let integrator build if throttle is too low
+    integral_roll = 0;
+  }
   integral_roll = constrain(integral_roll, -i_limit, i_limit); //Saturate integrator to prevent unsafe buildup
   derivative_roll = GyroX;
   roll_PID = 0.01*(Kp_roll_angle*error_roll + Ki_roll_angle*integral_roll - Kd_roll_angle*derivative_roll); //Scaled by .01 to bring within -1 to 1 range
@@ -589,9 +518,9 @@ void controlANGLE() {
   //Pitch
   error_pitch = pitch_des - pitch_IMU;
   integral_pitch = integral_pitch_prev + error_pitch*dt;
-//   if (channel_1_pwm < 1060) {   //Don't let integrator build if throttle is too low
-//     integral_pitch = 0;
-//   }
+  if (channel_1_pwm < 1060) {   //Don't let integrator build if throttle is too low
+    integral_pitch = 0;
+  }
   integral_pitch = constrain(integral_pitch, -i_limit, i_limit); //Saturate integrator to prevent unsafe buildup
   derivative_pitch = GyroY;
   pitch_PID = .01*(Kp_pitch_angle*error_pitch + Ki_pitch_angle*integral_pitch - Kd_pitch_angle*derivative_pitch); //Scaled by .01 to bring within -1 to 1 range
@@ -599,9 +528,9 @@ void controlANGLE() {
   //Yaw, stablize on rate from GyroZ
   error_yaw = yaw_des - GyroZ;
   integral_yaw = integral_yaw_prev + error_yaw*dt;
-//   if (channel_1_pwm < 1060) {   //Don't let integrator build if throttle is too low
-//     integral_yaw = 0;
-//   }
+  if (channel_1_pwm < 1060) {   //Don't let integrator build if throttle is too low
+    integral_yaw = 0;
+  }
   integral_yaw = constrain(integral_yaw, -i_limit, i_limit); //Saturate integrator to prevent unsafe buildup
   derivative_yaw = (error_yaw - error_yaw_prev)/dt; 
   yaw_PID = .01*(Kp_yaw*error_yaw + Ki_yaw*integral_yaw + Kd_yaw*derivative_yaw); //Scaled by .01 to bring within -1 to 1 range
@@ -646,10 +575,10 @@ void controlMixer() {
    */
    
   //Quad mixing - EXAMPLE
-  m1_command_scaled = thro_des - pitch_PID + roll_PID + yaw_PID; //Front Left
-  m2_command_scaled = thro_des - pitch_PID - roll_PID - yaw_PID; //Front Right
-  m3_command_scaled = thro_des + pitch_PID - roll_PID + yaw_PID; //Back Right
-  m4_command_scaled = thro_des + pitch_PID + roll_PID - yaw_PID; //Back Left
+  m1_command_scaled = constrain(thro_des - pitch_PID + roll_PID + yaw_PID, 0.0, 1.0); //Front Left
+  m2_command_scaled = constrain(thro_des - pitch_PID - roll_PID - yaw_PID, 0.0, 1.0); //Front Right
+  m3_command_scaled = constrain(thro_des + pitch_PID - roll_PID + yaw_PID, 0.0, 1.0); //Back Right
+  m4_command_scaled = constrain(thro_des + pitch_PID + roll_PID - yaw_PID, 0.0, 1.0); //Back Left
   m5_command_scaled = 0;
   m6_command_scaled = 0;
 
@@ -662,4 +591,128 @@ void controlMixer() {
   s6_command_scaled = 0;
   s7_command_scaled = 0;
  
+}
+
+void loopRate(int freq) {
+  //DESCRIPTION: Regulate main loop rate to specified frequency in Hz
+  /*
+   * It's good to operate at a constant loop rate for filters to remain stable and whatnot. Interrupt routines running in the
+   * background cause the loop rate to fluctuate. This function basically just waits at the end of every loop iteration until 
+   * the correct time has passed since the start of the current loop for the desired loop rate in Hz. 2kHz is a good rate to 
+   * be at because the loop nominally will run between 2.8kHz - 4.2kHz. This lets us have a little room to add extra computations
+   * and remain above 2kHz, without needing to retune all of our filtering parameters.
+   */
+  float invFreq = 1.0/freq*1000000.0;
+  unsigned long checker = micros();
+  
+  //Sit in loop until appropriate time has passed
+  while (invFreq > (checker - current_time)) {
+    checker = micros();
+  }
+}
+
+void keyboard_control(int key) {
+        switch (getch()) {
+                case KEY_Q:
+                        refresh();
+                        break;
+                case KEY_W:
+                        speed_pitch = 2000;
+                        fwd_bkwd = 1;
+                        y = 1.0;
+                        refresh();
+                        break;
+                case KEY_E:
+                        refresh();
+                        break;
+                case KEY_A:
+                        speed_roll = 2000;
+                        left_right = 2;
+                        x = 1.0;
+                        refresh();
+                        break;
+                case KEY_S:
+                        speed_pitch = 2000;
+                        fwd_bkwd = 2;
+                        y = 1.0;
+                        refresh();
+                        break;
+                case KEY_D:
+                        speed_roll = 2000;
+                        left_right = 1;
+                        x = 1.0;
+                        refresh();
+                        break;
+                case KEY_Z:
+                        speed_control = speed_control + 50;
+                        if (speed_control > 2000) {
+                        speed_control = 2000;
+                        }
+                        refresh();
+                        break;
+                case KEY_X:
+                        speed_control = speed_control - 50;
+                        if (speed_control < 1000) {
+                        speed_control = 1000;
+                        }
+                        refresh();
+                        break;
+                case KEY_T:
+                        exit = 1;
+                        refresh();
+                        break;
+                }
+                clear_counter = clear_counter + 1;
+                if (clear_counter == 1) {
+                        clear_counter = 0;
+                        clear();
+                }
+                value = key;
+                refresh();
+    
+        if(time_since_update > 0.01){
+        speed_roll = (float)speed_roll * x;
+        time_since_update = 0.0;
+        x = x - 0.1;
+        if(speed_roll < 0){
+                x = 1.0;
+        }
+        if(left_right == 1){
+                roll_angle = (int)speed_roll;
+        }
+        if(left_right == 2){
+                roll_angle = (int)-speed_roll;
+        }
+        speed_pitch = (float)speed_pitch * y;
+        y = y - 0.1;
+        if(speed_pitch < 0){
+                y = 1.0;
+        }
+        if(fwd_bkwd == 1){
+                pitch_angle = (int)speed_pitch;
+        }
+        if(fwd_bkwd == 2){
+                pitch_angle = (int)-speed_pitch;
+        }
+    }
+}
+
+void *  threadFunction(void * arg){
+    initscr();
+    cbreak();
+    noecho();
+    timeout(20);
+
+    char key = getch();
+    value = key;
+    while(1){
+        keyboard_control(value);
+        printw("\nPitch: %5.2f Roll: %5.2f Yaw: %5.2f | dt %2.5f",pitch_IMU, roll_IMU, yaw_IMU ,dt);
+        printw("\nPitchDes: %5.2f RollDes: %5.2f YawDes: %5.2f Throttle: %2.5f | dt %2.5f",pitch_des, roll_des, yaw_des, thro_des, dt);
+        printw("\nPitchPID: %5.2f RollPID: %5.2f YawPID: %5.2f ",pitch_PID, roll_PID, yaw_PID);
+        printw("\nThrottle: %d", speed_control);
+        printw("\nM1: %f | M2: %f \nM3: %f | M4 %f", m1_command_scaled, m2_command_scaled, m3_command_scaled, m4_command_scaled);
+
+    }
+    return NULL;
 }
